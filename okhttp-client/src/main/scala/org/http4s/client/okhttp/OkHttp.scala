@@ -1,30 +1,21 @@
 package org.http4s.client.okhttp
 
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
 
 import cats.data._
 import cats.effect._
 import cats.implicits._
 import cats.effect.implicits._
-import okhttp3.{
-  Call,
-  Callback,
-  OkHttpClient,
-  Protocol,
-  RequestBody,
-  WebSocket,
-  WebSocketListener,
-  Headers => OKHeaders,
-  MediaType => OKMediaType,
-  Request => OKRequest,
-  Response => OKResponse
-}
+import okhttp3.{Call, Callback, OkHttpClient, Protocol, RequestBody, WebSocket, WebSocketListener, Headers => OKHeaders, MediaType => OKMediaType, Request => OKRequest, Response => OKResponse}
 import okio.{BufferedSink, ByteString}
 import org.http4s.{Header, Headers, HttpVersion, Method, Request, Response, Status}
 import org.http4s.client.{Client, DisposableResponse, DisposableWebsocket, WebsocketClient}
 import fs2.Stream._
 import fs2._
 import fs2.io._
+import org.http4s.websocket.WebsocketBits.{Binary, Close, Text}
 import org.log4s.getLogger
 import org.http4s.websocket.{Websocket, WebsocketBits}
 
@@ -184,6 +175,13 @@ object OkHttp {
 
   // websockets
 
+  object WSClose {
+    implicit class CloseWithReason(c: Close) {
+      def reason: Option[String] = if(c.data.size < 3) None else Some(new String(ByteBuffer.wrap(c.data, 2, c.data.size).array(), Charset.forName("UTF-8")))
+    }
+    def unapply(c: Close): Option[(Int, Option[String])] = Some((c.closeCode, c.reason))
+  }
+
   def websocket[F[_]]()(
       implicit F: Effect[F], ec: ExecutionContext
   ): F[WebsocketClient[F]] =
@@ -219,7 +217,14 @@ object OkHttp {
                   val ws = client.newWebSocket(toOkHttpRequest(req), listener)
                   val input: Pipe[F, WebsocketBits.WebSocketFrame, Unit] = Sink {
                     b: WebsocketBits.WebSocketFrame =>
-                      F.delay { ws.send(ByteString.of(b.data: _*)); () }
+                      b match {
+                        case Text(t, _) =>
+                          F.delay { ws.send(t); () }
+                        case Binary(d, _) =>
+                          F.delay { ws.send(ByteString.of(d: _*)); () }
+                        case WSClose(code, reason) =>
+                          F.delay { ws.close(code, reason.orNull); ()}
+                      }
                   }
                   cb(Right(DisposableWebsocket(Websocket[F](outputBits, input), F.delay {
                     ws.cancel()
