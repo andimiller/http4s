@@ -10,6 +10,7 @@ import fs2._
 import fs2.interop.reactivestreams.{StreamSubscriber, StreamUnicastPublisher}
 import _root_.io.netty.handler.codec.http.{DefaultHttpHeaders, HttpHeaders}
 import _root_.io.netty.buffer.Unpooled
+import _root_.io.netty.util.concurrent.Future
 import org.asynchttpclient.AsyncHandler.State
 import org.asynchttpclient.handler.StreamedAsyncHandler
 import org.asynchttpclient.request.body.generator.{BodyGenerator, ReactiveStreamsBodyGenerator}
@@ -18,10 +19,15 @@ import org.http4s.internal.invokeCallback
 import org.http4s.util.threads._
 import org.log4s.getLogger
 import org.reactivestreams.Publisher
+
 import scala.collection.JavaConverters._
 import _root_.io.netty.handler.codec.http.cookie.Cookie
 import org.asynchttpclient.uri.Uri
 import org.asynchttpclient.cookie.CookieStore
+import org.asynchttpclient.ws.{WebSocketListener, WebSocketUpgradeHandler}
+import org.http4s.client.WebSocketClient.RawWebSocketConnection
+import org.http4s.websocket.WebSocketFrame
+import scodec.bits.ByteVector
 
 object AsyncHttpClient {
   private[this] val logger = getLogger
@@ -51,6 +57,20 @@ object AsyncHttpClient {
         }, F.delay(c.close)))
 
   /**
+    * Allocates a WebSocketClient and its shutdown mechanism for freeing resources.
+    */
+  def allocateWebSocket[F[_]](config: AsyncHttpClientConfig = defaultConfig)(
+      implicit F: ConcurrentEffect[F]): F[(WebSocketClient[F], F[Unit])] =
+    F.delay(new DefaultAsyncHttpClient(config))
+      .map(c =>
+        (WebSocketClient[F] { req =>
+          Resource(F.async[(RawWebSocketConnection[F], F[Unit])] { cb =>
+            c.executeRequest(toWebSocketAsyncRequest(req), webSocketHandler(cb))
+            ()
+          })
+        }, F.delay(c.close)))
+
+  /**
     * Create an HTTP client based on the AsyncHttpClient library
     *
     * @param config configuration for the client
@@ -59,6 +79,15 @@ object AsyncHttpClient {
   def resource[F[_]](config: AsyncHttpClientConfig = defaultConfig)(
       implicit F: ConcurrentEffect[F]): Resource[F, Client[F]] =
     Resource(allocate(config))
+
+  /**
+    * Create a WebSocket client based on the AsyncHttpClient library
+    *
+    * @param config configuration for the client
+    */
+  def resourceWebSocket[F[_]](config: AsyncHttpClientConfig = defaultConfig)(
+      implicit F: ConcurrentEffect[F]): Resource[F, WebSocketClient[F]] =
+    Resource(allocateWebSocket(config))
 
   /**
     * Create a bracketed HTTP client based on the AsyncHttpClient library.
@@ -120,6 +149,94 @@ object AsyncHttpClient {
       }
     }
 
+  private def nettyFutureToF[F[_]: ConcurrentEffect, T](f: Future[T]): F[T] =
+    ConcurrentEffect[F].async[T] { cb =>
+      val _ = f.addListener(
+        (future: Future[T]) =>
+          if (future.isSuccess) {
+            cb(Right(future.get()))
+          } else {
+            cb(Left(future.cause()))
+        }
+      )
+    }
+
+  private def webSocketHandler[F[_]](cb: Callback[(RawWebSocketConnection[F], F[Unit])])(
+      implicit F: ConcurrentEffect[F]) =
+    new WebSocketUpgradeHandler.Builder()
+      .addWebSocketListener(new WebSocketListener {
+        var opened: Boolean = false
+        val sent = fs2.concurrent.Queue.unbounded[F, WebSocketFrame].toIO.unsafeRunSync()
+
+        override def onOpen(websocket: ws.WebSocket): Unit = {
+          opened = true
+          val receive: Pipe[F, WebSocketFrame, Unit] = {
+            wsfs: Stream[F, WebSocketFrame] =>
+              wsfs.evalMap {
+                case WebSocketFrame.Text(str, last) =>
+                  nettyFutureToF[F, Void](websocket.sendTextFrame(str, last, 0)).void
+                case WebSocketFrame.Binary(bv, last) =>
+                  nettyFutureToF[F, Void](websocket.sendBinaryFrame(bv.toArray, last, 0)).void
+                case WebSocketFrame.Ping(data) =>
+                  nettyFutureToF[F, Void](websocket.sendPingFrame(data.toArray)).void
+                case WebSocketFrame.Pong(data) =>
+                  nettyFutureToF[F, Void](websocket.sendPongFrame(data.toArray)).void
+                case WebSocketFrame.Continuation(data, last) =>
+                  nettyFutureToF[F, Void](websocket.sendContinuationFrame(data.toArray, last, 0)).void
+                case close: WebSocketFrame.Close =>
+                  nettyFutureToF[F, Void](websocket.sendCloseFrame(close.closeCode, "")).void
+              }
+          }
+          val send: Stream[F, WebSocketFrame] = sent.dequeue
+          cb(
+            Right(
+              (
+                WebSocketConnection(send, receive, F.unit),
+                F.unit.flatMap { _ =>
+                  nettyFutureToF[F, Void](websocket.sendCloseFrame()).void
+                }
+              ))
+          )
+        }
+        override def onClose(websocket: ws.WebSocket, code: Int, reason: String): Unit =
+          sent
+            .enqueue1(WebSocketFrame.Close(code, reason).leftMap(_ => WebSocketFrame.Close()).merge)
+            .runAsync(_ => IO.unit)
+            .unsafeRunSync()
+
+        override def onBinaryFrame(payload: Array[Byte], finalFragment: Boolean, rsv: Int): Unit =
+          sent
+            .enqueue1(WebSocketFrame.Binary(ByteVector(payload), finalFragment))
+            .runAsync(_ => IO.unit)
+            .unsafeRunSync()
+
+        override def onTextFrame(payload: String, finalFragment: Boolean, rsv: Int): Unit =
+          sent
+            .enqueue1(WebSocketFrame.Text(payload, finalFragment))
+            .runAsync(_ => IO.unit)
+            .unsafeRunSync()
+
+        override def onPingFrame(payload: Array[Byte]): Unit =
+          sent
+            .enqueue1(WebSocketFrame.Ping(ByteVector(payload)))
+            .runAsync(_ => IO.unit)
+            .unsafeRunSync()
+
+        override def onPongFrame(payload: Array[Byte]): Unit =
+          sent
+            .enqueue1(WebSocketFrame.Pong(ByteVector(payload)))
+            .runAsync(_ => IO.unit)
+            .unsafeRunSync()
+
+        override def onError(t: Throwable): Unit = {
+          logger.error(t)("error from async-http-client's websocket handler")
+          if (!opened) {
+            cb(Left(t))
+          }
+        }
+      })
+      .build()
+
   private def toAsyncRequest[F[_]: ConcurrentEffect](request: Request[F]): AsyncRequest = {
     val headers = new DefaultHttpHeaders
     for (h <- request.headers.toList)
@@ -128,6 +245,16 @@ object AsyncHttpClient {
       .setUrl(request.uri.renderString)
       .setHeaders(headers)
       .setBody(getBodyGenerator(request))
+      .build()
+  }
+
+  private def toWebSocketAsyncRequest[F[_]: ConcurrentEffect](request: Request[F]): AsyncRequest = {
+    val headers = new DefaultHttpHeaders
+    for (h <- request.headers.toList)
+      headers.add(h.name.value, h.value)
+    new RequestBuilder(request.method.renderString)
+      .setUrl(request.uri.renderString)
+      .setHeaders(headers)
       .build()
   }
 
